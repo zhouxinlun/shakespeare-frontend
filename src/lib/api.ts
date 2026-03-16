@@ -7,10 +7,10 @@ import type {
   NovelEvaluation,
   BookEvaluation,
   BookEvaluationHistory,
-  NovelEvaluationComparison,
   NovelLiveEvaluation,
   NovelLatestEvaluation,
   NovelStats,
+  NovelChatHistory,
   AIConfig,
   AIModelMap,
   ProviderBaseURLMap,
@@ -82,9 +82,13 @@ export const novelApi = {
   latestEvaluations: (projectId: number) =>
     http.get<NovelLatestEvaluation[]>(`/projects/${projectId}/evaluations/latest`),
   parseUrl: (projectId: number) => `/api/projects/${projectId}/novels/parse`,
+  chatUrl: (projectId: number) => `/api/projects/${projectId}/novels/chat`,
+  chatHistory: (projectId: number, limit = 120, offset = 0) =>
+    http.get<NovelChatHistory>(`/projects/${projectId}/novels/chat/history`, {
+      params: { limit, offset },
+    }),
+  clearChatHistory: (projectId: number) => http.delete(`/projects/${projectId}/novels/chat/history`),
   evaluateUrl: (projectId: number, novelId: number) => `/api/projects/${projectId}/novels/${novelId}/evaluate`,
-  evaluateAllUrl: (projectId: number) => `/api/projects/${projectId}/novels/evaluate-all`,
-  evaluateBatchUrl: (projectId: number) => `/api/projects/${projectId}/novels/evaluate-batch`,
   evaluateBook: (
     projectId: number,
     data?: Partial<{
@@ -103,10 +107,6 @@ export const novelApi = {
     http.post<NovelLiveEvaluation>(`/projects/${projectId}/novels/${novelId}/evaluate-live`, {
       temporary_content: temporaryContent,
       chapter_title: chapterTitle,
-    }),
-  compareEvaluations: (projectId: number, novelId: number, version1: number, version2: number) =>
-    http.get<NovelEvaluationComparison>(`/projects/${projectId}/novels/${novelId}/evaluations/compare`, {
-      params: { version1, version2 },
     }),
 }
 

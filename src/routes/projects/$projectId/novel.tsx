@@ -1,38 +1,41 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ArrowDown,
+  ArrowUp,
   BookOpen,
   Brain,
   Loader2,
-  Pencil,
   Plus,
+  Send,
   Sparkles,
   Trash2,
-  ArrowUp,
-  ArrowDown,
+  X,
 } from 'lucide-react'
 
-import { novelApi } from '@/lib/api'
+import { novelApi, projectApi } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { useToastStore } from '@/stores/toast'
 import type {
   BookEvaluation,
   BookEvaluationHistory,
   Novel,
+  NovelChatHistory,
   NovelEvaluation,
-  NovelEvaluationComparison,
-  NovelLiveEvaluation,
   NovelLatestEvaluation,
+  NovelLiveEvaluation,
   NovelStats,
 } from '@/types/api'
+import type { Project } from '@/types/pipeline'
 
 type ParseMode = 'auto' | 'rule_only' | 'ai_only'
 type ParsePath = 'guided_rule' | 'intelligent'
-type RuleType = 'title' | 'separator' | 'rhythm'
+type RuleType = 'title' | 'separator' | 'custom'
 type TwistStrategy = 'aggressive' | 'balanced' | 'conservative'
 type CliffhangerStyle = 'suspense' | 'reversal' | 'climax' | 'dialogue'
 type DashboardTab = 'overview' | 'consistency' | 'suggestions' | 'trend'
+type ChatSkill = 'auto' | 'chapter_eval' | 'chapter_rewrite' | 'story_overview' | 'character_insight' | 'platform_advice'
 
 interface ParsedChapter {
   volume?: string
@@ -57,6 +60,57 @@ interface StreamEvent {
   progress?: number
   data?: unknown
   [key: string]: unknown
+}
+
+interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  skill?: Exclude<ChatSkill, 'auto'>
+  createdAt?: string
+  isStreaming?: boolean
+}
+
+const CHAT_SKILLS: Array<{ value: ChatSkill; label: string; hint: string }> = [
+  { value: 'auto', label: '自动推荐', hint: '根据问题自动匹配最合适的技能' },
+  { value: 'chapter_eval', label: '章节评估', hint: '给出问题定位与优先级建议' },
+  { value: 'chapter_rewrite', label: '章节改写', hint: '输出可替换正文与改写意图' },
+  { value: 'story_overview', label: '全书梳理', hint: '总结结构与节奏风险' },
+  { value: 'character_insight', label: '人物分析', hint: '分析关系、动机与成长线' },
+  { value: 'platform_advice', label: '平台建议', hint: '给出发布与包装建议' },
+]
+
+const CHAT_QUICK_PROMPTS: Record<ChatSkill, string[]> = {
+  auto: [
+    '请先判断我最需要用哪个技能，再给出3条可执行建议。',
+    '请按当前章节问题给出优先级最高的改进动作。',
+    '我下一步先改哪几章最划算？',
+  ],
+  chapter_eval: [
+    '评估我选中章节的转折与挂念，按 high/medium/low 给建议。',
+    '指出最影响留存的3个问题，并给出可执行修改动作。',
+    '如果我只能改一处，最应该改哪里，为什么？',
+  ],
+  chapter_rewrite: [
+    '把当前最后一段改成“悬念型结尾”，保留人设和设定。',
+    '把这一章开头改得更抓人，要求30秒内建立冲突。',
+    '给我一个更短、更有冲击力的版本，控制在300字内。',
+  ],
+  story_overview: [
+    '梳理全书主线和分集节奏，指出结构断层。',
+    '按章节给我“保留/重写/删除”建议列表。',
+    '基于当前内容，给一个更稳的分集路线图。',
+  ],
+  character_insight: [
+    '分析主角、反派、配角的动机冲突与成长线。',
+    '指出人物关系里最有潜力的反转点。',
+    '找出人物行为不一致的章节并给修复建议。',
+  ],
+  platform_advice: [
+    '按短剧平台习惯，给我标题、卖点和首集优化建议。',
+    '我这个题材更适合哪个平台，为什么？',
+    '结合当前内容给3条提高完播率的动作建议。',
+  ],
 }
 
 async function streamSSE(
@@ -110,11 +164,12 @@ async function streamSSE(
       }
 
       if (!dataLines.length) continue
+
       try {
         const parsed = JSON.parse(dataLines.join('\n')) as StreamEvent
         options.onEvent(parsed, eventName)
       } catch {
-        // ignore malformed chunks
+        // ignore malformed frames
       }
     }
   }
@@ -127,6 +182,8 @@ export function NovelPage() {
   const showToast = useToastStore((s) => s.show)
 
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [editorOpen, setEditorOpen] = useState(false)
+
   const [showManualForm, setShowManualForm] = useState(false)
   const [manualVolume, setManualVolume] = useState('')
   const [manualTitle, setManualTitle] = useState('')
@@ -139,13 +196,11 @@ export function NovelPage() {
   const [parseOpen, setParseOpen] = useState(false)
   const [parseText, setParseText] = useState('')
   const [parsePath, setParsePath] = useState<ParsePath>('guided_rule')
-  const [parseMode, setParseMode] = useState<ParseMode>('auto')
   const [ruleType, setRuleType] = useState<RuleType>('title')
   const [separatorPattern, setSeparatorPattern] = useState('---')
+  const [customSplitRule, setCustomSplitRule] = useState('')
   const [twistStrategy, setTwistStrategy] = useState<TwistStrategy>('balanced')
   const [cliffhangerStyle, setCliffhangerStyle] = useState<CliffhangerStyle>('suspense')
-  const [targetPlatform, setTargetPlatform] = useState('')
-  const [targetAudience, setTargetAudience] = useState('')
   const [contentGenre, setContentGenre] = useState('')
   const [parseProgress, setParseProgress] = useState(0)
   const [parseMessage, setParseMessage] = useState('等待开始解析')
@@ -158,25 +213,31 @@ export function NovelPage() {
   const [evaluatingId, setEvaluatingId] = useState<number | null>(null)
   const [evaluationMessage, setEvaluationMessage] = useState('')
   const [currentEvaluation, setCurrentEvaluation] = useState<NovelEvaluation | null>(null)
-  const [isEvaluatingAll, setIsEvaluatingAll] = useState(false)
-  const [isEvaluatingBatch, setIsEvaluatingBatch] = useState(false)
-  const [batchMessage, setBatchMessage] = useState('')
-  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(null)
-  const [selectedBatchIds, setSelectedBatchIds] = useState<number[]>([])
   const [liveEvaluation, setLiveEvaluation] = useState<NovelLiveEvaluation | null>(null)
   const [isLiveEvaluating, setIsLiveEvaluating] = useState(false)
   const [liveEvaluationError, setLiveEvaluationError] = useState('')
-  const [evaluationHistory, setEvaluationHistory] = useState<NovelEvaluation[]>([])
-  const [isHistoryLoading, setIsHistoryLoading] = useState(false)
-  const [historyError, setHistoryError] = useState('')
-  const [compareVersion1, setCompareVersion1] = useState<number | null>(null)
-  const [compareVersion2, setCompareVersion2] = useState<number | null>(null)
-  const [compareResult, setCompareResult] = useState<NovelEvaluationComparison | null>(null)
-  const [isComparing, setIsComparing] = useState(false)
-  const [compareError, setCompareError] = useState('')
+
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>('overview')
   const [isEvaluatingBook, setIsEvaluatingBook] = useState(false)
   const [bookEvaluationMessage, setBookEvaluationMessage] = useState('')
+
+  const [draggingNovelId, setDraggingNovelId] = useState<number | null>(null)
+  const [dropTargetId, setDropTargetId] = useState<number | null>(null)
+  const [trashOver, setTrashOver] = useState(false)
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [chatSkill, setChatSkill] = useState<ChatSkill>('auto')
+  const [chatSelectedIds, setChatSelectedIds] = useState<number[]>([])
+  const [chatHistoryBootstrapped, setChatHistoryBootstrapped] = useState(false)
+  const [isClearingChatHistory, setIsClearingChatHistory] = useState(false)
+  const chatBottomRef = useRef<HTMLDivElement>(null)
+
+  const { data: project } = useQuery<Project>({
+    queryKey: ['project', id],
+    queryFn: () => projectApi.get(id).then((r) => r.data),
+  })
 
   const { data: novels = [], isLoading } = useQuery({
     queryKey: ['novels', id],
@@ -199,6 +260,11 @@ export function NovelPage() {
   } = useQuery<BookEvaluationHistory>({
     queryKey: ['novels-book-history', id],
     queryFn: () => novelApi.bookHistory(id, 10, 0).then((r) => r.data),
+  })
+
+  const { data: chatHistory, isLoading: isChatHistoryLoading } = useQuery<NovelChatHistory>({
+    queryKey: ['novels-chat-history', id],
+    queryFn: () => novelApi.chatHistory(id, 120, 0).then((r) => r.data),
   })
 
   const evaluationMap = useMemo(() => {
@@ -232,8 +298,8 @@ export function NovelPage() {
   const selectedNovel = useMemo(() => {
     if (!sortedNovels.length) return null
     if (!selectedId) return sortedNovels[0]
-    return sortedNovels.find((n) => n.id === selectedId) ?? sortedNovels[0]
-  }, [sortedNovels, selectedId])
+    return sortedNovels.find((item) => item.id === selectedId) ?? sortedNovels[0]
+  }, [selectedId, sortedNovels])
 
   const selectedEvaluation = useMemo(() => {
     if (!selectedNovel) return null
@@ -244,19 +310,23 @@ export function NovelPage() {
   }, [currentEvaluation, evaluationMap, selectedNovel])
 
   const effectiveParseMode = useMemo<ParseMode>(() => {
-    if (parsePath === 'intelligent') {
-      return parseMode === 'rule_only' ? 'ai_only' : parseMode
-    }
-    if (ruleType === 'separator' && parseMode === 'auto') {
-      return 'rule_only'
-    }
-    return parseMode
-  }, [parseMode, parsePath, ruleType])
+    if (parsePath === 'intelligent') return 'ai_only'
+    if (ruleType === 'title') return 'auto'
+    return 'rule_only'
+  }, [parsePath, ruleType])
 
-  const parseUnitLabel = parsePath === 'intelligent' || ruleType === 'rhythm' ? '段' : '章'
+  const parseUnitLabel = parsePath === 'intelligent' ? '集' : '章'
 
   useEffect(() => {
-    if (!selectedNovel) return
+    if (!project || contentGenre.trim()) return
+    setContentGenre(contentTypeName(project.content_type))
+  }, [project, contentGenre])
+
+  useEffect(() => {
+    if (!selectedNovel) {
+      setEditorOpen(false)
+      return
+    }
     setEditingVolume(selectedNovel.volume || '')
     setEditingTitle(selectedNovel.chapter_title || '')
     setEditingContent(selectedNovel.content || '')
@@ -265,7 +335,7 @@ export function NovelPage() {
   }, [selectedNovel])
 
   useEffect(() => {
-    if (!selectedNovel) return
+    if (!selectedNovel || !editorOpen) return
     if (evaluatingId === selectedNovel.id) return
 
     const draft = editingContent.trim()
@@ -288,11 +358,9 @@ export function NovelPage() {
       } catch (error) {
         if (cancelled) return
         setLiveEvaluation(null)
-        setLiveEvaluationError(String(error))
+        setLiveEvaluationError(extractErrorMessage(error))
       } finally {
-        if (!cancelled) {
-          setIsLiveEvaluating(false)
-        }
+        if (!cancelled) setIsLiveEvaluating(false)
       }
     }, 700)
 
@@ -300,55 +368,35 @@ export function NovelPage() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [id, selectedNovel, editingContent, editingTitle, evaluatingId])
+  }, [id, selectedNovel, editorOpen, editingContent, editingTitle, evaluatingId])
 
   useEffect(() => {
     const validIds = new Set(sortedNovels.map((item) => item.id))
-    setSelectedBatchIds((prev) => prev.filter((item) => validIds.has(item)))
+    setChatSelectedIds((prev) => prev.filter((item) => validIds.has(item)))
   }, [sortedNovels])
 
   useEffect(() => {
-    if (!selectedNovel) {
-      setEvaluationHistory([])
-      setCompareVersion1(null)
-      setCompareVersion2(null)
-      setCompareResult(null)
-      setHistoryError('')
-      return
-    }
+    setChatMessages([])
+    setChatHistoryBootstrapped(false)
+  }, [id])
 
-    let cancelled = false
-    setIsHistoryLoading(true)
-    setHistoryError('')
-    setCompareError('')
-    setCompareResult(null)
+  useEffect(() => {
+    if (chatHistoryBootstrapped || !chatHistory) return
+    setChatMessages(
+      chatHistory.messages.map((item) => ({
+        id: `history-${item.id}`,
+        role: item.role,
+        content: item.message,
+        skill: item.skill || undefined,
+        createdAt: item.created_at,
+      }))
+    )
+    setChatHistoryBootstrapped(true)
+  }, [chatHistory, chatHistoryBootstrapped])
 
-    novelApi
-      .listEvaluations(id, selectedNovel.id)
-      .then((response) => {
-        if (cancelled) return
-        const list = response.data
-        setEvaluationHistory(list)
-        setCompareVersion2(list[0]?.id ?? null)
-        setCompareVersion1(list[1]?.id ?? null)
-      })
-      .catch((error) => {
-        if (cancelled) return
-        setEvaluationHistory([])
-        setCompareVersion1(null)
-        setCompareVersion2(null)
-        setHistoryError(String(error))
-      })
-      .finally(() => {
-        if (!cancelled) setIsHistoryLoading(false)
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [id, selectedNovel, latestEvaluations])
-
-  const isAllBatchSelected = sortedNovels.length > 0 && selectedBatchIds.length === sortedNovels.length
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages])
 
   const refreshAll = async () => {
     await Promise.all([
@@ -356,6 +404,7 @@ export function NovelPage() {
       queryClient.invalidateQueries({ queryKey: ['novels-stats', id] }),
       queryClient.invalidateQueries({ queryKey: ['novels-latest-evaluations', id] }),
       queryClient.invalidateQueries({ queryKey: ['novels-book-history', id] }),
+      queryClient.invalidateQueries({ queryKey: ['novels-chat-history', id] }),
     ])
   }
 
@@ -375,7 +424,7 @@ export function NovelPage() {
       showToast('章节已更新', 'success')
     },
     onError: (error: unknown) => {
-      showToast(String(error), 'error')
+      showToast(extractErrorMessage(error), 'error')
     },
   })
 
@@ -386,6 +435,9 @@ export function NovelPage() {
       showToast('章节已删除', 'success')
       setCurrentEvaluation(null)
     },
+    onError: (error: unknown) => {
+      showToast(extractErrorMessage(error), 'error')
+    },
   })
 
   const clearMutation = useMutation({
@@ -395,6 +447,9 @@ export function NovelPage() {
       showToast('已清空全部章节', 'success')
       setCurrentEvaluation(null)
     },
+    onError: (error: unknown) => {
+      showToast(extractErrorMessage(error), 'error')
+    },
   })
 
   const reorderMutation = useMutation({
@@ -402,14 +457,18 @@ export function NovelPage() {
     onSuccess: async () => {
       await refreshAll()
     },
+    onError: (error: unknown) => {
+      showToast(extractErrorMessage(error), 'error')
+    },
   })
 
-  const selectNovel = (novel: Novel) => {
+  const selectNovel = (novel: Novel, openEditor = false) => {
     setSelectedId(novel.id)
     setEditingVolume(novel.volume || '')
     setEditingTitle(novel.chapter_title || '')
     setEditingContent(novel.content || '')
     setCurrentEvaluation(evaluationMap.get(novel.id) ?? null)
+    if (openEditor) setEditorOpen(true)
   }
 
   const addManualChapter = async () => {
@@ -420,7 +479,7 @@ export function NovelPage() {
     }
 
     const nextIndex = sortedNovels.length
-      ? Math.max(...sortedNovels.map((n) => n.chapter_index)) + 1
+      ? Math.max(...sortedNovels.map((item) => item.chapter_index)) + 1
       : 1
 
     try {
@@ -437,12 +496,13 @@ export function NovelPage() {
       setManualContent('')
       showToast('章节已添加', 'success')
     } catch (error) {
-      showToast(String(error), 'error')
+      showToast(extractErrorMessage(error), 'error')
     }
   }
 
   const saveSelectedChapter = async () => {
     if (!selectedNovel) return
+
     const content = editingContent.trim()
     if (!content) {
       showToast('章节正文不能为空', 'error')
@@ -460,7 +520,7 @@ export function NovelPage() {
   }
 
   const moveChapter = async (novel: Novel, direction: 'up' | 'down') => {
-    const idx = sortedNovels.findIndex((n) => n.id === novel.id)
+    const idx = sortedNovels.findIndex((item) => item.id === novel.id)
     if (idx < 0) return
 
     const target = direction === 'up' ? idx - 1 : idx + 1
@@ -479,18 +539,23 @@ export function NovelPage() {
     )
   }
 
-  const toggleBatchSelection = (novelId: number) => {
-    setSelectedBatchIds((prev) =>
-      prev.includes(novelId) ? prev.filter((item) => item !== novelId) : [...prev, novelId]
-    )
-  }
+  const reorderByDrag = async (sourceId: number, targetId: number) => {
+    if (sourceId === targetId) return
 
-  const toggleSelectAllBatch = () => {
-    if (isAllBatchSelected) {
-      setSelectedBatchIds([])
-      return
-    }
-    setSelectedBatchIds(sortedNovels.map((item) => item.id))
+    const sourceIndex = sortedNovels.findIndex((item) => item.id === sourceId)
+    const targetIndex = sortedNovels.findIndex((item) => item.id === targetId)
+    if (sourceIndex < 0 || targetIndex < 0) return
+
+    const reordered = [...sortedNovels]
+    const [moved] = reordered.splice(sourceIndex, 1)
+    reordered.splice(targetIndex, 0, moved)
+
+    await reorderMutation.mutateAsync(
+      reordered.map((item, index) => ({
+        novel_id: item.id,
+        chapter_index: index + 1,
+      }))
+    )
   }
 
   const openParseModal = () => {
@@ -500,12 +565,20 @@ export function NovelPage() {
     setParseMeta({})
     setParseAnalysis(null)
     setParsedChapters([])
+    if (project?.content_type) {
+      setContentGenre(contentTypeName(project.content_type))
+    }
   }
 
   const startParse = async () => {
     const text = parseText.trim()
     if (!text) {
       showToast('请先粘贴小说文本', 'error')
+      return
+    }
+
+    if (parsePath === 'guided_rule' && ruleType === 'custom' && !customSplitRule.trim()) {
+      showToast('请先输入自定义分割规则', 'error')
       return
     }
 
@@ -520,13 +593,13 @@ export function NovelPage() {
       await streamSSE(novelApi.parseUrl(id), {
         body: {
           raw_text: text,
+          parse_path: parsePath,
           mode: effectiveParseMode,
-          rule_type: ruleType,
-          separator_pattern: ruleType === 'separator' ? separatorPattern.trim() || undefined : undefined,
-          twist_strategy: parsePath === 'intelligent' || ruleType === 'rhythm' ? twistStrategy : undefined,
-          cliffhanger_style: parsePath === 'intelligent' || ruleType === 'rhythm' ? cliffhangerStyle : undefined,
-          target_platform: parsePath === 'intelligent' ? targetPlatform.trim() || undefined : undefined,
-          target_audience: parsePath === 'intelligent' ? targetAudience.trim() || undefined : undefined,
+          rule_type: parsePath === 'guided_rule' ? ruleType : 'title',
+          separator_pattern: parsePath === 'guided_rule' && ruleType === 'separator' ? separatorPattern.trim() || undefined : undefined,
+          custom_split_rule: parsePath === 'guided_rule' && ruleType === 'custom' ? customSplitRule.trim() || undefined : undefined,
+          twist_strategy: parsePath === 'intelligent' ? twistStrategy : undefined,
+          cliffhanger_style: parsePath === 'intelligent' ? cliffhangerStyle : undefined,
           content_genre: parsePath === 'intelligent' ? contentGenre.trim() || undefined : undefined,
         },
         onEvent: (event, eventName) => {
@@ -540,9 +613,7 @@ export function NovelPage() {
             setParseMessage(event.message || '解析中...')
           } else if (type === 'analysis') {
             const payload = event.data as ParseAnalysis | undefined
-            if (payload) {
-              setParseAnalysis(payload)
-            }
+            if (payload) setParseAnalysis(payload)
           } else if (type === 'chunk') {
             const payload = event.data as ParsedChapter
             if (payload && payload.content) {
@@ -570,7 +641,7 @@ export function NovelPage() {
       })
     } catch (error) {
       setParseMessage('解析失败')
-      showToast(String(error), 'error')
+      showToast(extractErrorMessage(error), 'error')
     } finally {
       setIsParsing(false)
     }
@@ -604,7 +675,7 @@ export function NovelPage() {
       setParsedChapters([])
       showToast('解析结果已保存', 'success')
     } catch (error) {
-      showToast(String(error), 'error')
+      showToast(extractErrorMessage(error), 'error')
     } finally {
       setIsSavingParsed(false)
     }
@@ -630,24 +701,24 @@ export function NovelPage() {
             const score = Number(event.score || 0)
             setCurrentEvaluation((prev) => {
               const base: NovelEvaluation = prev && prev.novel_id === novel.id
-                  ? prev
-                  : {
-                    id: 0,
-                    novel_id: novel.id,
-                    content_type: 'short_drama',
-                    evaluation_type: 'chapter_only',
-                    overall_score: 0,
-                    dimension_scores: {},
-                    summary: '',
-                    suggestions: [],
-                    novel_revision: 1,
-                    parent_evaluation_id: null,
-                    model_used: 'novel_evaluator',
-                    prompt_version: 'short_drama.v1',
-                    project_id: id,
-                    created_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString(),
-                  }
+                ? prev
+                : {
+                  id: 0,
+                  novel_id: novel.id,
+                  content_type: project?.content_type || 'short_drama',
+                  evaluation_type: 'chapter_only',
+                  overall_score: 0,
+                  dimension_scores: {},
+                  summary: '',
+                  suggestions: [],
+                  novel_revision: 1,
+                  parent_evaluation_id: null,
+                  model_used: 'novel_evaluator',
+                  prompt_version: `${project?.content_type || 'short_drama'}.v1`,
+                  project_id: id,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                }
               return {
                 ...base,
                 dimension_scores: {
@@ -658,9 +729,7 @@ export function NovelPage() {
             })
           } else if (type === 'done') {
             const evaluation = event.evaluation as NovelEvaluation | undefined
-            if (evaluation) {
-              setCurrentEvaluation(evaluation)
-            }
+            if (evaluation) setCurrentEvaluation(evaluation)
             setEvaluationMessage('评估完成')
           } else if (type === 'error') {
             throw new Error(event.message || '评估失败')
@@ -674,144 +743,181 @@ export function NovelPage() {
       showToast('章节评估完成', 'success')
     } catch (error) {
       setEvaluationMessage('评估失败')
-      showToast(String(error), 'error')
+      showToast(extractErrorMessage(error), 'error')
     } finally {
       setEvaluatingId(null)
     }
   }
 
-  const evaluateAll = async () => {
-    setIsEvaluatingAll(true)
-    setEvaluationMessage('开始重评全书...')
-
-    try {
-      await streamSSE(novelApi.evaluateAllUrl(id), {
-        body: {},
-        onEvent: (event, eventName) => {
-          if (eventName === 'fallback_warning') {
-            showToast(event.message || '评估模型已切换到备用配置', 'info')
-          }
-
-          const type = event.type
-          if (type === 'chapter_start') {
-            setEvaluationMessage(`正在评估：${String(event.chapter_title || '')}`)
-          } else if (type === 'chapter_done') {
-            if (event.error) {
-              showToast(`章节评估失败：${String(event.chapter_title || '')}`, 'error')
-            }
-          } else if (type === 'done') {
-            const avg = event.avg_score
-            setEvaluationMessage(`全书评估完成，平均分 ${avg ?? '-'} `)
-          } else if (type === 'error') {
-            throw new Error(event.message || '全书评估失败')
-          }
-        },
-      })
-      await refreshAll()
-      showToast('全书评估完成', 'success')
-    } catch (error) {
-      setEvaluationMessage('全书评估失败')
-      showToast(String(error), 'error')
-    } finally {
-      setIsEvaluatingAll(false)
-    }
-  }
-
   const evaluateBook = async () => {
     if (!sortedNovels.length) {
-      showToast('当前项目没有章节，无法执行全书评估', 'error')
+      showToast('当前项目没有章节，无法生成仪表盘', 'error')
       return
     }
 
     setIsEvaluatingBook(true)
-    setBookEvaluationMessage('正在进行全书质量体检...')
+    setBookEvaluationMessage('正在生成全书质量仪表盘...')
     try {
       await novelApi.evaluateBook(id)
       await refreshAll()
-      setBookEvaluationMessage('全书质量体检已完成')
-      showToast('全书质量体检完成', 'success')
+      setBookEvaluationMessage('全书质量仪表盘已更新')
+      showToast('全书质量仪表盘已生成', 'success')
     } catch (error) {
-      setBookEvaluationMessage('全书质量体检失败')
-      showToast(String(error), 'error')
+      setBookEvaluationMessage('仪表盘生成失败')
+      showToast(extractErrorMessage(error), 'error')
     } finally {
       setIsEvaluatingBook(false)
     }
   }
 
-  const evaluateBatch = async () => {
-    if (!selectedBatchIds.length) {
-      showToast('请先勾选要评估的章节', 'error')
-      return
+  const sendChat = async () => {
+    const message = chatInput.trim()
+    if (!message || chatLoading) return
+
+    const selectedSkill = chatSkill === 'auto' ? undefined : chatSkill
+    const userMsg: ChatMessage = {
+      id: `${Date.now()}-u`,
+      role: 'user',
+      content: message,
+      skill: selectedSkill,
+      createdAt: new Date().toISOString(),
+    }
+    const assistantId = `${Date.now()}-a`
+    const assistantMsg: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      skill: selectedSkill,
+      createdAt: new Date().toISOString(),
+      isStreaming: true,
     }
 
-    setIsEvaluatingBatch(true)
-    setBatchMessage('开始批量评估...')
-    setBatchProgress({ current: 0, total: selectedBatchIds.length })
-    setCurrentEvaluation(null)
+    setChatMessages((prev) => [...prev, userMsg, assistantMsg])
+    setChatInput('')
+    setChatLoading(true)
 
     try {
-      await streamSSE(novelApi.evaluateBatchUrl(id), {
-        body: { novel_ids: selectedBatchIds },
+      await streamSSE(novelApi.chatUrl(id), {
+        body: {
+          message,
+          skill: selectedSkill,
+          novel_ids: chatSelectedIds.length ? chatSelectedIds : undefined,
+        },
         onEvent: (event, eventName) => {
           if (eventName === 'fallback_warning') {
-            showToast(event.message || '评估模型已切换到备用配置', 'info')
+            showToast(event.message || 'Chat 模型已切换到备用配置', 'info')
+            return
           }
 
           const type = event.type
-          if (type === 'progress') {
-            const current = Number(event.current || 0)
-            const total = Number(event.total || selectedBatchIds.length)
-            const chapter = String(event.chapter || '')
-            setBatchProgress({ current, total })
-            setBatchMessage(chapter ? `批量评估中 ${current}/${total}：${chapter}` : `批量评估中 ${current}/${total}`)
-          } else if (type === 'complete') {
-            const results = Array.isArray(event.results) ? event.results : []
-            const failedCount = results.filter((item) => item && typeof item === 'object' && 'error' in item).length
-            const successCount = results.length - failedCount
-            setBatchProgress({ current: Number(event.total || results.length), total: Number(event.total || results.length) })
-            setBatchMessage(`批量评估完成：成功 ${successCount}，失败 ${failedCount}`)
+          if (type === 'skill_recommendation') {
+            const recommended = typeof event.recommended_skill === 'string' ? event.recommended_skill : ''
+            const reason = typeof event.reason === 'string' ? event.reason : ''
+            const skill = isChatSkill(recommended) ? recommended : undefined
+            if (skill) {
+              setChatMessages((prev) =>
+                prev.map((item) =>
+                  item.id === assistantId
+                    ? { ...item, skill }
+                    : item
+                )
+              )
+            }
+            if (reason) {
+              showToast(reason, 'info')
+            }
+            return
+          }
+
+          if (type === 'content') {
+            const payload = event.data as { chunk?: unknown } | undefined
+            const chunk = typeof payload?.chunk === 'string' ? payload.chunk : ''
+            if (!chunk) return
+            setChatMessages((prev) =>
+              prev.map((item) =>
+                item.id === assistantId ? { ...item, content: item.content + chunk } : item
+              )
+            )
           } else if (type === 'error') {
-            throw new Error(event.message || '批量评估失败')
+            throw new Error(event.message || 'Chat 失败')
           }
         },
       })
-      await refreshAll()
-      showToast('批量评估完成', 'success')
     } catch (error) {
-      setBatchMessage('批量评估失败')
-      showToast(String(error), 'error')
+      setChatMessages((prev) =>
+        prev.map((item) =>
+          item.id === assistantId
+            ? { ...item, content: extractErrorMessage(error), isStreaming: false }
+            : item
+        )
+      )
     } finally {
-      setIsEvaluatingBatch(false)
+      setChatLoading(false)
+      setChatMessages((prev) =>
+        prev.map((item) => (item.id === assistantId ? { ...item, isStreaming: false } : item))
+      )
+      await queryClient.invalidateQueries({ queryKey: ['novels-chat-history', id] })
     }
   }
 
-  const runCompare = async () => {
-    if (!selectedNovel || compareVersion1 == null || compareVersion2 == null) {
-      showToast('请选择两个评估版本', 'error')
-      return
-    }
-    if (compareVersion1 === compareVersion2) {
-      showToast('请选择两个不同的版本', 'error')
-      return
-    }
+  const toggleChatChapterSelection = (novelId: number) => {
+    setChatSelectedIds((prev) =>
+      prev.includes(novelId) ? prev.filter((item) => item !== novelId) : [...prev, novelId]
+    )
+  }
 
-    setIsComparing(true)
-    setCompareError('')
-    setCompareResult(null)
+  const applyQuickPrompt = (prompt: string) => {
+    setChatInput(prompt)
+  }
+
+  const clearChatHistory = async () => {
+    if (chatLoading || isClearingChatHistory || !chatMessages.length) return
+    const shouldClear = window.confirm('确认清空当前项目的小说 Chat 历史吗？')
+    if (!shouldClear) return
+
+    setIsClearingChatHistory(true)
     try {
-      const response = await novelApi.compareEvaluations(id, selectedNovel.id, compareVersion1, compareVersion2)
-      setCompareResult(response.data)
+      await novelApi.clearChatHistory(id)
+      setChatMessages([])
+      await queryClient.invalidateQueries({ queryKey: ['novels-chat-history', id] })
+      showToast('聊天历史已清空', 'success')
     } catch (error) {
-      setCompareError(String(error))
+      showToast(extractErrorMessage(error), 'error')
     } finally {
-      setIsComparing(false)
+      setIsClearingChatHistory(false)
     }
+  }
+
+  const handleCardDrop = async (targetId: number) => {
+    if (draggingNovelId == null) return
+    try {
+      await reorderByDrag(draggingNovelId, targetId)
+    } finally {
+      setDraggingNovelId(null)
+      setDropTargetId(null)
+    }
+  }
+
+  const handleTrashDrop = async () => {
+    if (draggingNovelId == null) {
+      setTrashOver(false)
+      return
+    }
+    const novel = sortedNovels.find((item) => item.id === draggingNovelId)
+    setTrashOver(false)
+    setDraggingNovelId(null)
+    setDropTargetId(null)
+    if (!novel) return
+
+    const shouldDelete = window.confirm(`确认删除 第${novel.chapter_index}章 吗？`)
+    if (!shouldDelete) return
+    deleteMutation.mutate(novel.id)
   }
 
   if (isLoading) {
     return (
       <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin mr-2" />
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
         加载章节中...
       </div>
     )
@@ -821,10 +927,10 @@ export function NovelPage() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground">
             <BookOpen className="h-5 w-5" /> 小说管理
           </h2>
-          <p className="text-xs text-muted-foreground mt-1">支持手动维护、智能解析和 AI 文本评估</p>
+          <p className="mt-1 text-xs text-muted-foreground">支持手动维护、智能解析、章节评估与小说协作 Chat</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -835,32 +941,10 @@ export function NovelPage() {
             <Sparkles className="h-4 w-4" /> 粘贴文本解析
           </button>
           <button
-            onClick={() => setShowManualForm((v) => !v)}
+            onClick={() => setShowManualForm((value) => !value)}
             className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-foreground hover:bg-accent"
           >
             <Plus className="h-4 w-4" /> 手动添加
-          </button>
-          <button
-            onClick={evaluateAll}
-            disabled={isEvaluatingAll || isEvaluatingBatch || isEvaluatingBook || !novels.length}
-            className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/40 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
-          >
-            {isEvaluatingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Brain className="h-4 w-4" />} 全书重评估
-          </button>
-          <button
-            onClick={evaluateBook}
-            disabled={isEvaluatingBook || isEvaluatingAll || isEvaluatingBatch || !novels.length}
-            className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/40 px-3 py-1.5 text-sm text-violet-300 hover:bg-violet-500/10 disabled:opacity-50"
-          >
-            {isEvaluatingBook ? <Loader2 className="h-4 w-4 animate-spin" /> : <Brain className="h-4 w-4" />} 全书质量体检
-          </button>
-          <button
-            onClick={evaluateBatch}
-            disabled={isEvaluatingBatch || isEvaluatingAll || isEvaluatingBook || !selectedBatchIds.length}
-            className="inline-flex items-center gap-1.5 rounded-md border border-cyan-500/40 px-3 py-1.5 text-sm text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-50"
-          >
-            {isEvaluatingBatch ? <Loader2 className="h-4 w-4 animate-spin" /> : <Brain className="h-4 w-4" />}
-            批量评估（{selectedBatchIds.length}）
           </button>
           <button
             onClick={() => {
@@ -874,23 +958,6 @@ export function NovelPage() {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground">
-        <button
-          onClick={toggleSelectAllBatch}
-          disabled={!sortedNovels.length}
-          className="rounded border border-border px-2 py-1 text-foreground hover:bg-accent disabled:opacity-50"
-        >
-          {isAllBatchSelected ? '取消全选' : '全选章节'}
-        </button>
-        <span>已选 {selectedBatchIds.length} / {sortedNovels.length} 章</span>
-        {batchProgress && (
-          <span>
-            · 进度 {batchProgress.current}/{batchProgress.total}
-          </span>
-        )}
-        {batchMessage && <span>· {batchMessage}</span>}
-      </div>
-
       <div className="grid gap-3 md:grid-cols-4">
         <StatsCard label="总章节" value={String(stats?.total_chapters ?? 0)} />
         <StatsCard label="总卷数" value={String(stats?.total_volumes ?? 0)} />
@@ -898,17 +965,26 @@ export function NovelPage() {
         <StatsCard label="平均评分" value={stats?.average_score != null ? stats.average_score.toFixed(2) : '-'} />
       </div>
 
-      <div className="rounded-xl border border-border bg-card p-4 space-y-3">
+      <div className="space-y-3 rounded-xl border border-border bg-card p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-sm font-semibold text-foreground">全书质量仪表板</h3>
-            <p className="mt-1 text-xs text-muted-foreground">基于章节评估结果做全书聚合、问题识别与优化建议。</p>
+            <p className="mt-1 text-xs text-muted-foreground">基于已评估章节聚合全书质量、分集合理性和优化建议。</p>
           </div>
-          {latestBookEvaluation && (
-            <p className="text-[11px] text-muted-foreground">
-              最近体检：{formatDateTime(latestBookEvaluation.created_at)} · {contentTypeName(latestBookEvaluation.content_type)}
-            </p>
-          )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={evaluateBook}
+              disabled={isEvaluatingBook || !novels.length}
+              className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/40 px-3 py-1.5 text-xs text-violet-300 hover:bg-violet-500/10 disabled:opacity-50"
+            >
+              {isEvaluatingBook ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Brain className="h-3.5 w-3.5" />} 生成仪表盘
+            </button>
+            {latestBookEvaluation && (
+              <p className="text-[11px] text-muted-foreground">
+                最近生成：{formatDateTime(latestBookEvaluation.created_at)}
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -935,11 +1011,11 @@ export function NovelPage() {
         </div>
 
         {isBookHistoryLoading ? (
-          <p className="text-xs text-muted-foreground flex items-center gap-1">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载全书评估中...
+          <p className="flex items-center gap-1 text-xs text-muted-foreground">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载仪表盘中...
           </p>
         ) : !latestBookEvaluation ? (
-          <p className="text-xs text-muted-foreground">暂无全书评估结果，点击“全书质量体检”生成仪表板数据。</p>
+          <p className="text-xs text-muted-foreground">暂无仪表盘数据，请先点击“生成仪表盘”。</p>
         ) : (
           <div className="space-y-3">
             {dashboardTab === 'overview' && (
@@ -955,14 +1031,14 @@ export function NovelPage() {
                 )}
                 <div className="grid gap-3 md:grid-cols-2">
                   <div className="rounded-lg border border-border bg-background/60 p-3">
-                    <p className="text-xs font-medium text-foreground mb-2">维度均分</p>
+                    <p className="mb-2 text-xs font-medium text-foreground">维度均分</p>
                     <div className="space-y-2">
                       {Object.entries(latestBookEvaluation.aggregated_stats?.dimension_averages || {}).map(([key, value]) => (
                         <ScoreRow key={`book-avg-${key}`} label={dimensionLabel(key)} score={Number(value)} />
                       ))}
                     </div>
                   </div>
-                  <div className="rounded-lg border border-border bg-background/60 p-3 space-y-2">
+                  <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
                     <p className="text-xs font-medium text-foreground">分布与低分章节</p>
                     <div className="grid grid-cols-2 gap-2">
                       {Object.entries(latestBookEvaluation.aggregated_stats?.score_distribution || {}).map(([key, value]) => (
@@ -1048,25 +1124,25 @@ export function NovelPage() {
       </div>
 
       {showManualForm && (
-        <div className="rounded-xl border border-border bg-card p-4 space-y-3">
+        <div className="space-y-3 rounded-xl border border-border bg-card p-4">
           <h3 className="text-sm font-medium text-foreground">手动添加章节</h3>
           <div className="grid gap-3 md:grid-cols-2">
             <input
               value={manualVolume}
-              onChange={(e) => setManualVolume(e.target.value)}
+              onChange={(event) => setManualVolume(event.target.value)}
               placeholder="卷名（可选）"
               className="rounded-md border border-border bg-background px-3 py-2 text-sm"
             />
             <input
               value={manualTitle}
-              onChange={(e) => setManualTitle(e.target.value)}
+              onChange={(event) => setManualTitle(event.target.value)}
               placeholder="章节标题（可选）"
               className="rounded-md border border-border bg-background px-3 py-2 text-sm"
             />
           </div>
           <textarea
             value={manualContent}
-            onChange={(e) => setManualContent(e.target.value)}
+            onChange={(event) => setManualContent(event.target.value)}
             rows={5}
             placeholder="请输入章节正文..."
             className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
@@ -1081,7 +1157,7 @@ export function NovelPage() {
         </div>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_380px]">
         <div className="space-y-4">
           {!groupedNovels.length && (
             <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
@@ -1091,41 +1167,58 @@ export function NovelPage() {
 
           {groupedNovels.map(([volume, chapters]) => (
             <div key={volume} className="rounded-xl border border-border bg-card p-3">
-              <h3 className="text-sm font-semibold text-foreground mb-2">{volume}</h3>
+              <h3 className="mb-2 text-sm font-semibold text-foreground">{volume}</h3>
               <div className="space-y-2">
                 {chapters.map((novel) => {
                   const score = evaluationMap.get(novel.id)?.overall_score
+                  const isDropTarget = dropTargetId === novel.id && draggingNovelId !== novel.id
                   return (
                     <div
                       key={novel.id}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.effectAllowed = 'move'
+                        setDraggingNovelId(novel.id)
+                        setDropTargetId(novel.id)
+                      }}
+                      onDragOver={(event) => {
+                        event.preventDefault()
+                        if (draggingNovelId != null) setDropTargetId(novel.id)
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        void handleCardDrop(novel.id)
+                      }}
+                      onDragEnd={() => {
+                        setDraggingNovelId(null)
+                        setDropTargetId(null)
+                        setTrashOver(false)
+                      }}
                       className={cn(
-                        'rounded-lg border p-3 transition-colors',
+                        'group relative rounded-lg border p-3 transition-colors',
                         selectedNovel?.id === novel.id
                           ? 'border-indigo-500/50 bg-indigo-500/10'
-                          : 'border-border hover:bg-accent/40'
+                          : 'border-border hover:bg-accent/40',
+                        isDropTarget && 'border-emerald-500/50 bg-emerald-500/10'
                       )}
                     >
+                      <span
+                        className={cn(
+                          'pointer-events-none absolute -left-2 top-1/2 -translate-y-1/2 rounded-full border border-border bg-background p-0.5 text-muted-foreground transition-opacity',
+                          draggingNovelId === novel.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                        )}
+                        title="拖拽排序"
+                      >
+                        <Plus className="h-3 w-3" />
+                      </span>
+
                       <div className="flex items-start justify-between gap-2">
-                        <label className="mt-0.5 flex items-center">
-                          <input
-                            type="checkbox"
-                            checked={selectedBatchIds.includes(novel.id)}
-                            onChange={() => toggleBatchSelection(novel.id)}
-                            className="h-4 w-4 rounded border-border bg-background"
-                            title="加入批量评估"
-                          />
-                        </label>
-                        <button
-                          onClick={() => selectNovel(novel)}
-                          className="min-w-0 flex-1 text-left"
-                        >
-                          <p className="text-sm font-medium text-foreground truncate">
+                        <button onClick={() => selectNovel(novel, true)} className="min-w-0 flex-1 text-left">
+                          <p className="truncate text-sm font-medium text-foreground">
                             第 {novel.chapter_index} 章 {novel.chapter_title || '未命名章节'}
                           </p>
-                          <p className="text-xs text-muted-foreground mt-1 line-clamp-2">
-                            {novel.content.slice(0, 110)}
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-1">
+                          <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{novel.content.slice(0, 110)}</p>
+                          <p className="mt-1 text-xs text-muted-foreground">
                             字数：{novel.word_count}
                             {score != null ? ` · 评分：${score.toFixed(1)}` : ''}
                           </p>
@@ -1133,29 +1226,22 @@ export function NovelPage() {
 
                         <div className="flex items-center gap-1">
                           <button
-                            onClick={() => moveChapter(novel, 'up')}
+                            onClick={() => void moveChapter(novel, 'up')}
                             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                             title="上移"
                           >
                             <ArrowUp className="h-3.5 w-3.5" />
                           </button>
                           <button
-                            onClick={() => moveChapter(novel, 'down')}
+                            onClick={() => void moveChapter(novel, 'down')}
                             className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                             title="下移"
                           >
                             <ArrowDown className="h-3.5 w-3.5" />
                           </button>
                           <button
-                            onClick={() => selectNovel(novel)}
-                            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                            title="编辑"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            onClick={() => evaluateOne(novel)}
-                            disabled={evaluatingId === novel.id || isEvaluatingAll || isEvaluatingBatch || isEvaluatingBook}
+                            onClick={() => void evaluateOne(novel)}
+                            disabled={evaluatingId != null}
                             className="rounded p-1 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
                             title="评估"
                           >
@@ -1178,221 +1264,296 @@ export function NovelPage() {
               </div>
             </div>
           ))}
+
+          <div
+            onDragOver={(event) => {
+              event.preventDefault()
+              if (draggingNovelId != null) setTrashOver(true)
+            }}
+            onDragLeave={() => setTrashOver(false)}
+            onDrop={(event) => {
+              event.preventDefault()
+              void handleTrashDrop()
+            }}
+            className={cn(
+              'rounded-xl border border-dashed p-4 text-center text-xs transition-colors',
+              draggingNovelId == null
+                ? 'border-border text-muted-foreground'
+                : trashOver
+                  ? 'border-red-500/60 bg-red-500/10 text-red-300'
+                  : 'border-red-500/40 text-red-300'
+            )}
+          >
+            <div className="flex items-center justify-center gap-1.5">
+              <Trash2 className="h-3.5 w-3.5" />
+              <span>{draggingNovelId == null ? '拖拽章节到这里可删除' : '松开鼠标删除章节'}</span>
+            </div>
+          </div>
         </div>
 
-        <aside className="rounded-xl border border-border bg-card p-4 space-y-4">
-          <div>
-            <h3 className="text-sm font-semibold text-foreground">章节编辑</h3>
-            <p className="text-xs text-muted-foreground mt-1">选择左侧章节后可编辑并保存</p>
+        <aside className="flex h-[70vh] flex-col rounded-xl border border-border bg-card">
+          <div className="flex items-start justify-between gap-2 border-b border-border px-4 py-3">
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">小说协作 Chat</h3>
+              <p className="mt-1 text-xs text-muted-foreground">按技能与章节范围和 AI 对话，支持评估、改写和策略建议。</p>
+            </div>
+            <button
+              onClick={() => void clearChatHistory()}
+              disabled={chatLoading || isClearingChatHistory || !chatMessages.length}
+              className="rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-accent disabled:opacity-50"
+            >
+              {isClearingChatHistory ? '清空中...' : '清空会话'}
+            </button>
           </div>
 
-          {!selectedNovel && (
-            <div className="text-sm text-muted-foreground">暂无可编辑章节</div>
-          )}
-
-          {selectedNovel && (
-            <>
-              <input
-                value={editingVolume}
-                onChange={(e) => setEditingVolume(e.target.value)}
-                placeholder="卷名"
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-              <input
-                value={editingTitle}
-                onChange={(e) => setEditingTitle(e.target.value)}
-                placeholder="章节标题"
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-              <textarea
-                value={editingContent}
-                onChange={(e) => setEditingContent(e.target.value)}
-                rows={12}
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              />
-              <div className="rounded-lg border border-border bg-background/60 p-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-medium text-foreground">实时评分（未保存）</p>
-                  {isLiveEvaluating && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
-                </div>
-                <p className="mt-1 text-[11px] text-muted-foreground">停止输入后自动刷新，不会写入数据库。</p>
-                {liveEvaluation ? (
-                  <div className="mt-2 space-y-2">
-                    <p className="text-xs text-foreground">
-                      总分：{liveEvaluation.overall_score.toFixed(2)} · 类型：{contentTypeName(liveEvaluation.content_type)}
-                    </p>
-                    {Object.entries(liveEvaluation.dimension_scores).map(([key, value]) => (
-                      <ScoreRow key={`live-${key}`} label={dimensionLabel(key)} score={Number(value)} />
-                    ))}
-                  </div>
-                ) : liveEvaluationError ? (
-                  <p className="mt-2 text-xs text-red-300">实时评分失败：{liveEvaluationError}</p>
-                ) : (
-                  <p className="mt-2 text-xs text-muted-foreground">编辑正文后将自动显示实时评分。</p>
-                )}
-              </div>
-              <button
-                onClick={saveSelectedChapter}
-                disabled={updateMutation.isPending}
-                className="w-full rounded-md bg-primary py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {updateMutation.isPending ? '保存中...' : '保存章节修改'}
-              </button>
-            </>
-          )}
-
-          <div className="border-t border-border pt-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h4 className="text-sm font-semibold text-foreground">AI 内容评估</h4>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  按当前项目内容类型自动选择评估维度。
-                </p>
-              </div>
-              {selectedNovel && (
+          <div className="space-y-3 border-b border-border px-4 py-3">
+            <div className="flex flex-wrap gap-2">
+              {CHAT_SKILLS.map((item) => (
                 <button
-                  onClick={() => evaluateOne(selectedNovel)}
-                  disabled={evaluatingId != null || isEvaluatingAll || isEvaluatingBatch || isEvaluatingBook}
-                  className="rounded-md border border-emerald-500/40 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+                  key={item.value}
+                  onClick={() => setChatSkill(item.value)}
+                  className={cn(
+                    'rounded-full border px-2.5 py-1 text-[11px] transition-colors',
+                    chatSkill === item.value
+                      ? 'border-indigo-500/50 bg-indigo-500/10 text-indigo-300'
+                      : 'border-border text-muted-foreground hover:bg-accent'
+                  )}
+                  title={item.hint}
                 >
-                  {evaluatingId === selectedNovel.id ? '评估中...' : '重新评估'}
+                  {item.label}
                 </button>
-              )}
+              ))}
             </div>
 
-            {evaluationMessage && <p className="text-xs text-muted-foreground mt-2">{evaluationMessage}</p>}
-
-            {selectedEvaluation ? (
-              <div className="space-y-2 mt-3">
-                <p className="text-sm font-medium text-foreground">总分：{selectedEvaluation.overall_score.toFixed(2)}</p>
-                <p className="text-[11px] text-muted-foreground">
-                  内容类型：{contentTypeName(selectedEvaluation.content_type)} · 评估版本：v{selectedEvaluation.novel_revision}
-                </p>
-                {Object.entries(selectedEvaluation.dimension_scores).map(([key, value]) => (
-                  <ScoreRow key={key} label={dimensionLabel(key)} score={Number(value)} />
-                ))}
-                {selectedEvaluation.summary && (
-                  <p className="text-xs text-muted-foreground leading-relaxed">{selectedEvaluation.summary}</p>
-                )}
-                {!!selectedEvaluation.suggestions?.length && (
-                  <div className="space-y-1">
-                    {selectedEvaluation.suggestions.slice(0, 3).map((item, idx) => (
-                      <p key={`${item.dimension}-${idx}`} className="text-xs text-foreground/90">
-                        [{item.priority}] {item.dimension}: {item.suggestion}
-                      </p>
-                    ))}
-                  </div>
-                )}
+            <div className="space-y-1">
+              <p className="text-[11px] text-muted-foreground">章节范围（可多选，不选即全书）</p>
+              <div className="max-h-20 overflow-auto">
+                <div className="flex flex-wrap gap-1.5">
+                  {sortedNovels.map((novel) => (
+                    <button
+                      key={`chat-scope-${novel.id}`}
+                      onClick={() => toggleChatChapterSelection(novel.id)}
+                      className={cn(
+                        'rounded border px-2 py-0.5 text-[11px] transition-colors',
+                        chatSelectedIds.includes(novel.id)
+                          ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                          : 'border-border text-muted-foreground hover:bg-accent'
+                      )}
+                    >
+                      第{novel.chapter_index}章
+                    </button>
+                  ))}
+                </div>
               </div>
-            ) : (
-              <p className="text-xs text-muted-foreground mt-2">暂无评估结果</p>
-            )}
+            </div>
+
+            <div className="space-y-1">
+              <p className="text-[11px] text-muted-foreground">快捷提问（点击填入输入框）</p>
+              <div className="flex flex-wrap gap-1.5">
+                {CHAT_QUICK_PROMPTS[chatSkill].map((prompt, idx) => (
+                  <button
+                    key={`quick-${chatSkill}-${idx}`}
+                    onClick={() => applyQuickPrompt(prompt)}
+                    className="rounded border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent"
+                  >
+                    {prompt}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
-          <div className="border-t border-border pt-4">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <h4 className="text-sm font-semibold text-foreground">版本对比</h4>
-                <p className="mt-1 text-xs text-muted-foreground">选择两个历史评估版本，比较维度变化与问题收敛。</p>
-              </div>
-              <button
-                onClick={runCompare}
-                disabled={isComparing || !selectedNovel || compareVersion1 == null || compareVersion2 == null}
-                className="rounded-md border border-indigo-500/40 px-2 py-1 text-xs text-indigo-300 hover:bg-indigo-500/10 disabled:opacity-50"
-              >
-                {isComparing ? '对比中...' : '开始对比'}
-              </button>
-            </div>
-
-            {isHistoryLoading && (
-              <p className="mt-2 text-xs text-muted-foreground flex items-center gap-1">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载评估历史...
+          <div className="flex-1 space-y-3 overflow-auto px-4 py-3">
+            {isChatHistoryLoading && !chatHistoryBootstrapped && (
+              <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> 正在加载会话历史...
               </p>
             )}
-            {historyError && <p className="mt-2 text-xs text-red-300">历史加载失败：{historyError}</p>}
-
-            {!isHistoryLoading && !historyError && evaluationHistory.length >= 2 && (
-              <div className="mt-3 space-y-3">
-                <div className="grid gap-2 md:grid-cols-2">
-                  <label className="space-y-1">
-                    <span className="text-[11px] text-muted-foreground">版本 1（基线）</span>
-                    <select
-                      value={compareVersion1 ?? ''}
-                      onChange={(e) => setCompareVersion1(Number(e.target.value) || null)}
-                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs"
-                    >
-                      <option value="">请选择</option>
-                      {evaluationHistory.map((item) => (
-                        <option key={`v1-${item.id}`} value={item.id}>
-                          {evaluationOptionLabel(item)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="space-y-1">
-                    <span className="text-[11px] text-muted-foreground">版本 2（目标）</span>
-                    <select
-                      value={compareVersion2 ?? ''}
-                      onChange={(e) => setCompareVersion2(Number(e.target.value) || null)}
-                      className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs"
-                    >
-                      <option value="">请选择</option>
-                      {evaluationHistory.map((item) => (
-                        <option key={`v2-${item.id}`} value={item.id}>
-                          {evaluationOptionLabel(item)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-
-                {compareError && <p className="text-xs text-red-300">对比失败：{compareError}</p>}
-
-                {compareResult && (
-                  <div className="space-y-2 rounded-lg border border-border bg-background/60 p-3">
-                    <p className="text-[11px] text-muted-foreground">
-                      v{compareResult.version1.novel_revision} ({formatDateTime(compareResult.version1.created_at)}) →
-                      v{compareResult.version2.novel_revision} ({formatDateTime(compareResult.version2.created_at)})
-                    </p>
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                      <span className="rounded border border-emerald-500/30 px-2 py-0.5 text-emerald-300">
-                        已解决问题 {compareResult.suggestions_resolved}
-                      </span>
-                      <span className="rounded border border-amber-500/30 px-2 py-0.5 text-amber-300">
-                        新问题 {compareResult.new_issues}
-                      </span>
-                    </div>
-                    <div className="space-y-1">
-                      {Object.entries(compareResult.comparison).map(([key, value]) => {
-                        const before = Number(value.before || 0)
-                        const after = Number(value.after || 0)
-                        const delta = Number(value.delta || 0)
-                        return (
-                          <div key={`cmp-${key}`} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 text-xs">
-                            <span className="text-foreground">{dimensionLabel(key)}</span>
-                            <span className="text-muted-foreground">{before.toFixed(1)} → {after.toFixed(1)}</span>
-                            <span className={cn(delta > 0 ? 'text-emerald-300' : delta < 0 ? 'text-red-300' : 'text-muted-foreground')}>
-                              {delta > 0 ? '+' : ''}{delta.toFixed(1)}
-                            </span>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </div>
-                )}
+            {!isChatHistoryLoading && chatMessages.length === 0 && (
+              <div className="rounded-lg border border-dashed border-border p-3 text-xs text-muted-foreground">
+                <p>可直接提问示例：</p>
+                <p className="mt-1">1. 评估第2章到第4章的转折与挂念问题。</p>
+                <p className="mt-1">2. 把第3章改写成更强悬念的结尾。</p>
+                <p className="mt-1">3. 分析当前小说人物关系和可发布平台建议。</p>
               </div>
             )}
+            {chatMessages.map((message) => (
+              <div key={message.id} className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
+                <div
+                  className={cn(
+                    'max-w-[92%] rounded-lg px-3 py-2 text-xs leading-relaxed',
+                    message.role === 'user'
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-background text-foreground'
+                  )}
+                >
+                  {(message.skill || message.createdAt) && (
+                    <p className="mb-1 text-[10px] opacity-70">
+                      {message.skill ? `Skill: ${chatSkillLabel(message.skill)}` : ''}
+                      {message.createdAt ? `${message.skill ? ' · ' : ''}${formatTime(message.createdAt)}` : ''}
+                    </p>
+                  )}
+                  <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                  {message.isStreaming && <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-current" />}
+                </div>
+              </div>
+            ))}
+            <div ref={chatBottomRef} />
+          </div>
 
-            {!isHistoryLoading && !historyError && evaluationHistory.length < 2 && (
-              <p className="mt-2 text-xs text-muted-foreground">至少需要两个评估版本才能进行对比。</p>
-            )}
+          <div className="border-t border-border p-3">
+            <div className="flex gap-2">
+              <textarea
+                value={chatInput}
+                onChange={(event) => setChatInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    void sendChat()
+                  }
+                }}
+                placeholder="输入你的问题或指令... (Enter 发送，Shift+Enter 换行)"
+                rows={3}
+                className="flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm"
+              />
+              <button
+                onClick={() => void sendChat()}
+                disabled={chatLoading || !chatInput.trim()}
+                className={cn(
+                  'self-end rounded-md p-2 transition-colors',
+                  chatLoading || !chatInput.trim()
+                    ? 'cursor-not-allowed bg-muted text-muted-foreground'
+                    : 'bg-primary text-primary-foreground hover:bg-primary/90'
+                )}
+              >
+                {chatLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              </button>
+            </div>
           </div>
         </aside>
       </div>
 
+      {editorOpen && selectedNovel && (
+        <div className="fixed inset-0 z-50 bg-black/60 p-4 md:p-8">
+          <div className="mx-auto flex h-full max-w-6xl flex-col rounded-xl border border-border bg-background shadow-2xl">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">章节编辑</h3>
+                <p className="mt-1 text-xs text-muted-foreground">第 {selectedNovel.chapter_index} 章 · {selectedNovel.chapter_title || '未命名章节'}</p>
+              </div>
+              <button
+                onClick={() => setEditorOpen(false)}
+                className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="grid flex-1 gap-4 overflow-hidden p-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+              <div className="space-y-3 overflow-auto">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <input
+                    value={editingVolume}
+                    onChange={(event) => setEditingVolume(event.target.value)}
+                    placeholder="卷名"
+                    className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm"
+                  />
+                  <input
+                    value={editingTitle}
+                    onChange={(event) => setEditingTitle(event.target.value)}
+                    placeholder="章节标题"
+                    className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm"
+                  />
+                </div>
+
+                <textarea
+                  value={editingContent}
+                  onChange={(event) => setEditingContent(event.target.value)}
+                  rows={22}
+                  className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm"
+                />
+
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    onClick={() => void saveSelectedChapter()}
+                    disabled={updateMutation.isPending}
+                    className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                  >
+                    {updateMutation.isPending ? '保存中...' : '保存章节修改'}
+                  </button>
+                  <button
+                    onClick={() => void evaluateOne(selectedNovel)}
+                    disabled={evaluatingId != null}
+                    className="rounded-md border border-emerald-500/40 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+                  >
+                    {evaluatingId === selectedNovel.id ? '评估中...' : '评估本章'}
+                  </button>
+                </div>
+                {evaluationMessage && <p className="text-xs text-muted-foreground">{evaluationMessage}</p>}
+              </div>
+
+              <div className="space-y-3 overflow-auto rounded-xl border border-border bg-card p-3">
+                <div className="rounded-lg border border-border bg-background/60 p-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-medium text-foreground">实时评分（未保存）</p>
+                    {isLiveEvaluating && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+                  </div>
+                  <p className="mt-1 text-[11px] text-muted-foreground">停止输入后自动刷新，不会写入数据库。</p>
+                  {liveEvaluation ? (
+                    <div className="mt-2 space-y-2">
+                      <p className="text-xs text-foreground">
+                        总分：{liveEvaluation.overall_score.toFixed(2)} · 类型：{contentTypeName(liveEvaluation.content_type)}
+                      </p>
+                      {Object.entries(liveEvaluation.dimension_scores).map(([key, value]) => (
+                        <ScoreRow key={`live-${key}`} label={dimensionLabel(key)} score={Number(value)} />
+                      ))}
+                    </div>
+                  ) : liveEvaluationError ? (
+                    <p className="mt-2 text-xs text-red-300">实时评分失败：{liveEvaluationError}</p>
+                  ) : (
+                    <p className="mt-2 text-xs text-muted-foreground">编辑正文后将自动显示实时评分。</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-border bg-background/60 p-3">
+                  <h4 className="text-sm font-semibold text-foreground">AI 内容评估</h4>
+                  <p className="mt-1 text-xs text-muted-foreground">按项目内容类型评估这一章。</p>
+
+                  {selectedEvaluation ? (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-sm font-medium text-foreground">总分：{selectedEvaluation.overall_score.toFixed(2)}</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        内容类型：{contentTypeName(selectedEvaluation.content_type)} · 版本：v{selectedEvaluation.novel_revision}
+                      </p>
+                      {Object.entries(selectedEvaluation.dimension_scores).map(([key, value]) => (
+                        <ScoreRow key={key} label={dimensionLabel(key)} score={Number(value)} />
+                      ))}
+                      {selectedEvaluation.summary && (
+                        <p className="text-xs leading-relaxed text-muted-foreground">{selectedEvaluation.summary}</p>
+                      )}
+                      {!!selectedEvaluation.suggestions?.length && (
+                        <div className="space-y-1">
+                          {selectedEvaluation.suggestions.slice(0, 3).map((item, idx) => (
+                            <p key={`${item.dimension}-${idx}`} className="text-xs text-foreground/90">
+                              [{item.priority}] {item.dimension}: {item.suggestion}
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-xs text-muted-foreground">暂无评估结果</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {parseOpen && (
         <div className="fixed inset-0 z-50 bg-black/50 p-4 md:p-8">
-          <div className="mx-auto h-full max-w-6xl rounded-xl border border-border bg-background shadow-2xl flex flex-col">
+          <div className="mx-auto flex h-full max-w-6xl flex-col rounded-xl border border-border bg-background shadow-2xl">
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <h3 className="text-sm font-semibold text-foreground">智能解析小说文本</h3>
               <button
@@ -1411,7 +1572,7 @@ export function NovelPage() {
                     <button
                       onClick={() => {
                         setParsePath('guided_rule')
-                        setParseMode('auto')
+                        setRuleType('title')
                       }}
                       className={cn(
                         'rounded-xl border p-3 text-left transition-colors',
@@ -1422,15 +1583,11 @@ export function NovelPage() {
                     >
                       <p className="text-sm font-semibold text-foreground">参考原文结构</p>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        适合已经有章标题、分隔符，或者你希望保留原文结构再做少量优化。
+                        只保留标题型/分隔型，也支持手动指定动态分割规则。
                       </p>
                     </button>
                     <button
-                      onClick={() => {
-                        setParsePath('intelligent')
-                        setRuleType('rhythm')
-                        setParseMode('ai_only')
-                      }}
+                      onClick={() => setParsePath('intelligent')}
                       className={cn(
                         'rounded-xl border p-3 text-left transition-colors',
                         parsePath === 'intelligent'
@@ -1438,14 +1595,9 @@ export function NovelPage() {
                           : 'border-border hover:bg-accent/40'
                       )}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-sm font-semibold text-foreground">AI 智能分集</p>
-                        <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] font-medium text-indigo-300">
-                          推荐
-                        </span>
-                      </div>
+                      <p className="text-sm font-semibold text-foreground">AI 智能分集</p>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        更适合短剧改编，按转折、节奏和挂念点组织分段，不机械按原文章节点切。
+                        保留转折策略、挂念风格和内容类型，按剧情起伏生成分集。
                       </p>
                     </button>
                   </div>
@@ -1453,7 +1605,7 @@ export function NovelPage() {
 
                 <textarea
                   value={parseText}
-                  onChange={(e) => setParseText(e.target.value)}
+                  onChange={(event) => setParseText(event.target.value)}
                   rows={14}
                   placeholder="在这里粘贴完整小说文本..."
                   className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm"
@@ -1464,23 +1616,18 @@ export function NovelPage() {
                     <div className="space-y-3">
                       <div>
                         <p className="text-sm font-medium text-foreground">结构参考方式</p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          规则不是硬约束，系统会优先参考这些结构，再决定是否补 AI 优化。
-                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">支持标题型、分隔型，或手动输入动态分割规则。</p>
                       </div>
+
                       <div className="grid gap-2 md:grid-cols-3">
                         {([
                           ['title', '标题型', '第X章 / Chapter N 等'],
                           ['separator', '分隔型', '--- / *** / === 等'],
-                          ['rhythm', '节奏型', '按转折点和短剧节奏切分'],
+                          ['custom', '手动规则', '字面量或 re:正则分割'],
                         ] as const).map(([value, label, desc]) => (
                           <button
                             key={value}
-                            onClick={() => {
-                              setRuleType(value)
-                              if (value === 'separator') setParseMode('rule_only')
-                              if (value === 'rhythm') setParseMode('auto')
-                            }}
+                            onClick={() => setRuleType(value)}
                             className={cn(
                               'rounded-lg border p-3 text-left transition-colors',
                               ruleType === value
@@ -1493,48 +1640,32 @@ export function NovelPage() {
                           </button>
                         ))}
                       </div>
+
                       {ruleType === 'separator' && (
                         <input
                           value={separatorPattern}
-                          onChange={(e) => setSeparatorPattern(e.target.value)}
+                          onChange={(event) => setSeparatorPattern(event.target.value)}
                           placeholder="分隔符，例如 --- 或 ***"
                           className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                         />
                       )}
-                      {ruleType === 'rhythm' && (
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <SelectField
-                            label="转折策略"
-                            value={twistStrategy}
-                            onChange={(value) => setTwistStrategy(value as TwistStrategy)}
-                            options={[
-                              ['aggressive', '激进：每个转折都值得分段'],
-                              ['balanced', '平衡：兼顾连贯和刺激'],
-                              ['conservative', '保守：只保留大转折'],
-                            ]}
-                          />
-                          <SelectField
-                            label="挂念风格"
-                            value={cliffhangerStyle}
-                            onChange={(value) => setCliffhangerStyle(value as CliffhangerStyle)}
-                            options={[
-                              ['suspense', '悬念型'],
-                              ['reversal', '反转型'],
-                              ['climax', '高潮型'],
-                              ['dialogue', '对话中断型'],
-                            ]}
-                          />
-                        </div>
+
+                      {ruleType === 'custom' && (
+                        <input
+                          value={customSplitRule}
+                          onChange={(event) => setCustomSplitRule(event.target.value)}
+                          placeholder="自定义规则：字面量行分割，或 re:正则表达式"
+                          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                        />
                       )}
                     </div>
                   ) : (
                     <div className="space-y-3">
                       <div>
                         <p className="text-sm font-medium text-foreground">AI 分集偏好</p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          让故事节奏决定分段数量，适合短剧改编、结构混乱文本和需要强挂念感的内容。
-                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">按剧情起伏和挂念感拆分短剧分集。</p>
                       </div>
+
                       <div className="grid gap-3 md:grid-cols-2">
                         <SelectField
                           label="转折策略"
@@ -1543,7 +1674,7 @@ export function NovelPage() {
                           options={[
                             ['aggressive', '激进：转折密度更高'],
                             ['balanced', '平衡：默认推荐'],
-                            ['conservative', '保守：保证叙事完整'],
+                            ['conservative', '保守：保证连贯'],
                           ]}
                         />
                         <SelectField
@@ -1557,22 +1688,11 @@ export function NovelPage() {
                             ['dialogue', '对话中断型'],
                           ]}
                         />
-                        <input
-                          value={targetPlatform}
-                          onChange={(e) => setTargetPlatform(e.target.value)}
-                          placeholder="目标平台，例如 抖音 / 小红书"
-                          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-                        />
-                        <input
-                          value={targetAudience}
-                          onChange={(e) => setTargetAudience(e.target.value)}
-                          placeholder="目标观众，例如 都市白领 / 学生"
-                          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-                        />
                       </div>
+
                       <input
                         value={contentGenre}
-                        onChange={(e) => setContentGenre(e.target.value)}
+                        onChange={(event) => setContentGenre(event.target.value)}
                         placeholder="内容类型，例如 悬疑 / 爱情 / 伦理"
                         className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                       />
@@ -1580,27 +1700,11 @@ export function NovelPage() {
                   )}
                 </div>
 
-                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_220px]">
-                  <div className="rounded-xl border border-border bg-card p-3">
-                    <p className="text-sm font-medium text-foreground">执行引擎（高级）</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      `自动` 会先看规则质量再决定是否调用 AI；`仅规则` 不调用 AI；`仅 AI` 直接全量交给模型。
-                    </p>
-                  </div>
-                  <div className="space-y-2">
-                    <select
-                      value={parseMode}
-                      onChange={(e) => setParseMode(e.target.value as ParseMode)}
-                      className="w-full rounded-md border border-border bg-card px-2 py-2 text-sm"
-                    >
-                      <option value="auto">自动（推荐）</option>
-                      <option value="rule_only">仅规则</option>
-                      <option value="ai_only">仅 AI</option>
-                    </select>
-                    <p className="text-xs text-muted-foreground">
-                      当前实际执行：{parseEngineLabel(effectiveParseMode)} · 字数：{parseText.length}
-                    </p>
-                  </div>
+                <div className="space-y-2 rounded-xl border border-border bg-card p-3">
+                  <p className="text-sm font-medium text-foreground">当前执行策略</p>
+                  <p className="text-xs text-muted-foreground">
+                    {parsePathLabel(parsePath)} · {parseEngineLabel(effectiveParseMode)} · 字数：{parseText.length}
+                  </p>
                 </div>
 
                 <div className="space-y-2">
@@ -1631,14 +1735,14 @@ export function NovelPage() {
 
                 <div className="flex gap-2">
                   <button
-                    onClick={startParse}
+                    onClick={() => void startParse()}
                     disabled={isParsing}
                     className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                   >
                     {isParsing ? '解析中...' : '开始解析'}
                   </button>
                   <button
-                    onClick={saveParsedResult}
+                    onClick={() => void saveParsedResult()}
                     disabled={isSavingParsed || !parsedChapters.length}
                     className="rounded-md border border-emerald-500/40 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
                   >
@@ -1648,15 +1752,15 @@ export function NovelPage() {
               </div>
 
               <div className="overflow-auto rounded-md border border-border bg-card p-3">
-                <h4 className="text-sm font-medium text-foreground mb-2">解析预览（{parsedChapters.length} {parseUnitLabel}）</h4>
+                <h4 className="mb-2 text-sm font-medium text-foreground">解析预览（{parsedChapters.length} {parseUnitLabel}）</h4>
                 <div className="space-y-3">
                   {parsedChapters.map((chapter, idx) => (
                     <div key={`${idx}-${chapter.chapter_index}`} className="rounded-md border border-border p-2">
                       <div className="grid gap-2 md:grid-cols-2">
                         <input
                           value={chapter.volume || ''}
-                          onChange={(e) => {
-                            const value = e.target.value
+                          onChange={(event) => {
+                            const value = event.target.value
                             setParsedChapters((prev) =>
                               prev.map((item, index) => (index === idx ? { ...item, volume: value } : item))
                             )
@@ -1666,8 +1770,8 @@ export function NovelPage() {
                         />
                         <input
                           value={chapter.chapter_title || ''}
-                          onChange={(e) => {
-                            const value = e.target.value
+                          onChange={(event) => {
+                            const value = event.target.value
                             setParsedChapters((prev) =>
                               prev.map((item, index) => (index === idx ? { ...item, chapter_title: value } : item))
                             )
@@ -1678,8 +1782,8 @@ export function NovelPage() {
                       </div>
                       <textarea
                         value={chapter.content}
-                        onChange={(e) => {
-                          const value = e.target.value
+                        onChange={(event) => {
+                          const value = event.target.value
                           setParsedChapters((prev) =>
                             prev.map((item, index) => (index === idx ? { ...item, content: value } : item))
                           )
@@ -1702,11 +1806,30 @@ export function NovelPage() {
   )
 }
 
+function isChatSkill(value: string): value is Exclude<ChatSkill, 'auto'> {
+  return (
+    value === 'chapter_eval'
+    || value === 'chapter_rewrite'
+    || value === 'story_overview'
+    || value === 'character_insight'
+    || value === 'platform_advice'
+  )
+}
+
+function chatSkillLabel(skill?: Exclude<ChatSkill, 'auto'>): string {
+  if (skill === 'chapter_eval') return '章节评估'
+  if (skill === 'chapter_rewrite') return '章节改写'
+  if (skill === 'story_overview') return '全书梳理'
+  if (skill === 'character_insight') return '人物分析'
+  if (skill === 'platform_advice') return '平台建议'
+  return '未指定'
+}
+
 function StatsCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border bg-card p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="text-lg font-semibold text-foreground mt-1">{value}</p>
+      <p className="mt-1 text-lg font-semibold text-foreground">{value}</p>
     </div>
   )
 }
@@ -1727,7 +1850,7 @@ function SelectField({
       <span className="text-xs text-muted-foreground">{label}</span>
       <select
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(event) => onChange(event.target.value)}
         className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
       >
         {options.map(([optionValue, optionLabel]) => (
@@ -1753,11 +1876,11 @@ function ScoreRow({ label, score }: { label: string; score: number }) {
   const pct = Math.max(0, Math.min(100, (score / 10) * 100))
   return (
     <div>
-      <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+      <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
         <span>{label}</span>
         <span>{score.toFixed(1)}</span>
       </div>
-      <div className="h-1.5 rounded bg-muted overflow-hidden">
+      <div className="h-1.5 overflow-hidden rounded bg-muted">
         <div className="h-full bg-emerald-400" style={{ width: `${pct}%` }} />
       </div>
     </div>
@@ -1801,7 +1924,9 @@ function parseMethodLabel(method?: string): string {
     ai_enhance: 'AI 增强修订',
     rule_fallback: '规则兜底',
     separator_rule: '分隔符规则解析',
-    rhythm_ai: '节奏优先 AI 解析',
+    custom_rule: '自定义规则解析',
+    rhythm_ai: '剧情起伏 AI 分集',
+    rhythm_rule: '剧情起伏规则分集',
   }
   if (!method) return '-'
   return map[method] || method
@@ -1809,7 +1934,7 @@ function parseMethodLabel(method?: string): string {
 
 function parseEngineLabel(mode: ParseMode): string {
   const map: Record<ParseMode, string> = {
-    auto: '自动',
+    auto: '自动（规则优先）',
     rule_only: '仅规则',
     ai_only: '仅 AI',
   }
@@ -1826,7 +1951,7 @@ function ruleTypeLabel(ruleType?: RuleType): string {
   const map: Record<RuleType, string> = {
     title: '标题型',
     separator: '分隔型',
-    rhythm: '节奏型',
+    custom: '手动规则',
   }
   if (!ruleType) return '-'
   return map[ruleType]
@@ -1850,8 +1975,11 @@ function formatDateTime(value?: string): string {
   return date.toLocaleString()
 }
 
-function evaluationOptionLabel(evaluation: NovelEvaluation): string {
-  return `v${evaluation.novel_revision} · ${formatDateTime(evaluation.created_at)} · ${evaluation.overall_score.toFixed(1)}分`
+function formatTime(value?: string): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleTimeString()
 }
 
 function issueSeverityClass(severity?: string): string {
@@ -1869,4 +1997,28 @@ function scoreBandLabel(key: string): string {
     poor: '待提升',
   }
   return map[key] || key
+}
+
+function extractErrorMessage(error: unknown): string {
+  if (typeof error === 'string') return error
+  if (error instanceof Error && error.message) return error.message
+
+  const maybeError = error as {
+    message?: string
+    response?: {
+      data?: {
+        detail?: string
+      }
+    }
+  }
+
+  if (typeof maybeError?.response?.data?.detail === 'string' && maybeError.response.data.detail.trim()) {
+    return maybeError.response.data.detail
+  }
+
+  if (typeof maybeError?.message === 'string' && maybeError.message.trim()) {
+    return maybeError.message
+  }
+
+  return '请求失败，请稍后重试'
 }

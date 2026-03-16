@@ -85,6 +85,27 @@ export interface NovelLiveEvaluation {
   generated_at: string
 }
 
+export type NovelChatSkill =
+  | 'chapter_eval'
+  | 'chapter_rewrite'
+  | 'story_overview'
+  | 'character_insight'
+  | 'platform_advice'
+
+export interface NovelChatMessageRecord {
+  id: number
+  role: 'user' | 'assistant'
+  message: string
+  skill?: NovelChatSkill | null
+  novel_ids: number[]
+  created_at: string
+}
+
+export interface NovelChatHistory {
+  total: number
+  messages: NovelChatMessageRecord[]
+}
+
 export interface NovelEvaluationComparisonItem {
   before: number
   after: number
