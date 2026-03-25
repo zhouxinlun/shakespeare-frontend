@@ -94,9 +94,14 @@ export type NovelChatSkill =
 
 export interface NovelChatMessageRecord {
   id: number
+  session_id: number
   role: 'user' | 'assistant'
   message: string
   skill?: NovelChatSkill | null
+  artifact_type?: string | null
+  artifact_status?: string | null
+  requires_confirmation?: boolean
+  artifact_payload?: Record<string, unknown> | null
   novel_ids: number[]
   created_at: string
 }
@@ -104,6 +109,21 @@ export interface NovelChatMessageRecord {
 export interface NovelChatHistory {
   total: number
   messages: NovelChatMessageRecord[]
+}
+
+export interface NovelChatSession {
+  id: number
+  title?: string | null
+  preview?: string | null
+  message_count: number
+  created_at: string
+  updated_at: string
+  last_message_at: string
+}
+
+export interface NovelChatSessionList {
+  total: number
+  sessions: NovelChatSession[]
 }
 
 export interface NovelEvaluationComparisonItem {

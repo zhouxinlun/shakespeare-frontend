@@ -11,6 +11,8 @@ import type {
   NovelLatestEvaluation,
   NovelStats,
   NovelChatHistory,
+  NovelChatSession,
+  NovelChatSessionList,
   AIConfig,
   AIModelMap,
   ProviderBaseURLMap,
@@ -72,6 +74,20 @@ export const novelApi = {
     novelId: number,
     data: Partial<{ chapter_index: number; volume?: string; chapter_title?: string; content: string }>
   ) => http.put<Novel>(`/projects/${projectId}/novels/${novelId}`, data),
+  rewriteFromChat: (
+    projectId: number,
+    novelId: number,
+    data: Partial<{
+      instruction: string
+      scope_label: string
+      reason: string
+      chapter_index: number
+      chapter_title: string
+      original_snippet: string
+      replacement_snippet: string
+      full_content: string
+    }>
+  ) => http.post<Novel>(`/projects/${projectId}/novels/${novelId}/rewrite-from-chat`, data),
   reorder: (projectId: number, orders: { novel_id: number; chapter_index: number }[]) =>
     http.put(`/projects/${projectId}/novels/reorder`, { orders }),
   delete: (projectId: number, novelId: number) =>
@@ -83,9 +99,17 @@ export const novelApi = {
     http.get<NovelLatestEvaluation[]>(`/projects/${projectId}/evaluations/latest`),
   parseUrl: (projectId: number) => `/api/projects/${projectId}/novels/parse`,
   chatUrl: (projectId: number) => `/api/projects/${projectId}/novels/chat`,
-  chatHistory: (projectId: number, limit = 120, offset = 0) =>
-    http.get<NovelChatHistory>(`/projects/${projectId}/novels/chat/history`, {
+  chatSessions: (projectId: number, limit = 40, offset = 0) =>
+    http.get<NovelChatSessionList>(`/projects/${projectId}/novels/chat/sessions`, {
       params: { limit, offset },
+    }),
+  createChatSession: (projectId: number) =>
+    http.post<NovelChatSession>(`/projects/${projectId}/novels/chat/sessions`),
+  deleteChatSession: (projectId: number, sessionId: number) =>
+    http.delete(`/projects/${projectId}/novels/chat/sessions/${sessionId}`),
+  chatHistory: (projectId: number, sessionId?: number | null, limit = 120, offset = 0) =>
+    http.get<NovelChatHistory>(`/projects/${projectId}/novels/chat/history`, {
+      params: { session_id: sessionId ?? undefined, limit, offset },
     }),
   clearChatHistory: (projectId: number) => http.delete(`/projects/${projectId}/novels/chat/history`),
   evaluateUrl: (projectId: number, novelId: number) => `/api/projects/${projectId}/novels/${novelId}/evaluate`,
